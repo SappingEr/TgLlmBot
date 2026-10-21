@@ -22,6 +22,12 @@ internal sealed class ChatHandlerTestServices : ITelegramMessageStorage, ISystem
 
     public bool FailStore { get; init; }
 
+    public int? FailStoreOnAttempt { get; init; }
+
+    public int StoreAttempts { get; private set; }
+
+    public DbChatMessage? RepliedMessage { get; init; }
+
     public Task<DbChatMessage> StoreMessageAsync(Message message, User self, CancellationToken cancellationToken)
     {
         return StoreAsync(message.Text);
@@ -39,7 +45,8 @@ internal sealed class ChatHandlerTestServices : ITelegramMessageStorage, ISystem
 
     private Task<DbChatMessage> StoreAsync(string? text)
     {
-        if (FailStore)
+        StoreAttempts++;
+        if (FailStore || StoreAttempts == FailStoreOnAttempt)
         {
             throw new InvalidOperationException("Storage is unavailable");
         }
@@ -50,7 +57,10 @@ internal sealed class ChatHandlerTestServices : ITelegramMessageStorage, ISystem
 
     public Task<DbChatMessage[]> SelectContextMessagesAsync(Message message, CancellationToken cancellationToken) => Task.FromResult<DbChatMessage[]>([]);
 
-    public Task<DbChatMessage?> SelectMessageAsync(long chatId, int messageId, CancellationToken cancellationToken) => Task.FromResult<DbChatMessage?>(null);
+    public Task<DbChatMessage?> SelectMessageAsync(long chatId, int messageId, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(RepliedMessage?.MessageId == messageId ? RepliedMessage : null);
+    }
 
     public Task<DbChatMessage[]> SelectContextMessagesBeforeAsync(long chatId, int messageId, DateTime date, CancellationToken cancellationToken) => throw new NotSupportedException();
 

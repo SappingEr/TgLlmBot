@@ -1,0 +1,31 @@
+name: .NET CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+      - name: Restore
+        run: dotnet restore TgLlmBot.slnx
+      - name: Build
+        run: dotnet build TgLlmBot.slnx -c Release --no-restore
+      - name: Test
+        run: dotnet test --solution TgLlmBot.slnx -c Release --no-build --minimum-expected-tests 1

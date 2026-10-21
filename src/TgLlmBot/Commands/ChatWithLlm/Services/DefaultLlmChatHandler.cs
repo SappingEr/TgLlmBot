@@ -110,7 +110,8 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
     {
         ArgumentNullException.ThrowIfNull(command);
         var typing = _typingStatusService.StartTyping(command.Message.Chat.Id);
-        var hasSentResponse = false;
+        var sentResponseParts = 0;
+        var totalResponseParts = 0;
         try
         {
             Log.ProcessingLlmRequest(_logger, command.Message.From?.Username, command.Message.From?.Id);
@@ -186,6 +187,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
                 parts = _responseFormatter.FormatPlainText(llmResponseText);
             }
 
+            totalResponseParts = parts.Length;
             typing.Stop();
             for (var i = 0; i < parts.Length; i++)
             {
@@ -194,7 +196,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
                 var response = await SendResponsePartAsync(command, parts[i], replyParameters, cancellationToken);
                 // Запись в БД может упасть уже после успешной отправки. Такой сбой не должен
                 // запускать повторную отправку этой части или всего ответа.
-                hasSentResponse = true;
+                sentResponseParts++;
                 await _storage.StoreMessageAsync(response, command.Self, request.CustomPrompt, parts[i].Text, cancellationToken);
             }
         }
@@ -208,8 +210,27 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
             Log.LlmInvocationOrImageProcessingFailed(_logger, ex);
             typing.Stop();
 
-            if (hasSentResponse)
+            if (sentResponseParts > 0)
             {
+                if (sentResponseParts < totalResponseParts)
+                {
+                    try
+                    {
+                        // Маркер обрыва не является ответом модели и в историю не попадает.
+                        await _bot.SendMessage(
+                            command.Message.Chat,
+                            "⚠️ Не удалось отправить ответ полностью. Повторите запрос.",
+                            ParseMode.None,
+                            new() { MessageId = command.Message.MessageId },
+                            messageThreadId: command.Message.MessageThreadId,
+                            cancellationToken: cancellationToken);
+                    }
+                    catch (Exception noticeException) when (noticeException is not OperationCanceledException)
+                    {
+                        Log.InterruptionNoticeFailed(_logger, noticeException);
+                    }
+                }
+
                 return;
             }
 
@@ -255,10 +276,9 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
 
     private static bool IsFormattingError(string message)
     {
-        return message.Contains("parse", StringComparison.OrdinalIgnoreCase)
-               || message.Contains("entity", StringComparison.OrdinalIgnoreCase)
-               || message.Contains("entities", StringComparison.OrdinalIgnoreCase)
+        return message.Contains("can't parse", StringComparison.OrdinalIgnoreCase)
                || message.Contains("unsupported tag", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("unsupported start tag", StringComparison.OrdinalIgnoreCase)
                || message.Contains("invalid rich message", StringComparison.OrdinalIgnoreCase)
                || message.Contains("rich_message_invalid", StringComparison.OrdinalIgnoreCase);
     }
@@ -497,7 +517,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         ChatAuthorDirectory authors)
     {
         var isBotMessage = replied.From?.Id == command.Self.Id || reply.Parts.Any(static x => x.IsLlmReplyToMessage);
-        var text = reply.Caption ?? (replied.Text ?? replied.Caption)?.Trim()
+        var text = FirstNonWhitespace(reply.Caption, replied.Text, replied.Caption)
             ?? (replied.RichMessage is { } richMessage ? TelegramRichMessageTextExtractor.Extract(richMessage) : null);
         var markers = reply.Attachments.Select(static x => ChatTranscriptFormat.FormatMediaMarker(x.Media));
         var excerpt = ChatTranscriptFormat.Excerpt(string.Join(' ', markers.Append(text).Where(static x => !string.IsNullOrEmpty(x))));
@@ -515,6 +535,21 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
             ? label
             : DescribeAuthor(replied.From, replied.SenderChat);
         return ChatTranscriptFormat.FormatReplyLine(replied.MessageId, author, excerpt);
+    }
+
+    private static string? FirstNonWhitespace(string? first, string? second, string? third = null)
+    {
+        if (!string.IsNullOrWhiteSpace(first))
+        {
+            return first.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(second))
+        {
+            return second.Trim();
+        }
+
+        return string.IsNullOrWhiteSpace(third) ? null : third.Trim();
     }
 
     /// <summary>
@@ -599,9 +634,9 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         foreach (var row in rows)
         {
             // Подпись у альбома одна на всю пачку и лежит на произвольной его части
-            if (string.IsNullOrEmpty(caption))
+            if (string.IsNullOrWhiteSpace(caption))
             {
-                caption = (row.Caption ?? row.Text)?.Trim();
+                caption = FirstNonWhitespace(row.Caption, row.Text);
             }
 
             // Пометка бывает только у ответов бота, а они альбомами не приходят - берём первую
@@ -895,5 +930,8 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
 
         [LoggerMessage(Level = LogLevel.Warning, Message = "Failed to format LLM response; retrying with plain text blocks")]
         public static partial void ResponseFormattingFailed(ILogger logger, Exception exception);
+
+        [LoggerMessage(Level = LogLevel.Warning, Message = "Failed to notify the chat about an incomplete LLM response")]
+        public static partial void InterruptionNoticeFailed(ILogger logger, Exception exception);
     }
 }

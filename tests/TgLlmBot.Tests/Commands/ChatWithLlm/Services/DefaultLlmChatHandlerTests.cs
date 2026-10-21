@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -14,6 +15,7 @@ using Telegram.Bot.Types.Enums;
 using TgLlmBot.Commands.ChatWithLlm;
 using TgLlmBot.Commands.ChatWithLlm.Services;
 using TgLlmBot.Configuration.TypedConfiguration.Llm;
+using TgLlmBot.DataAccess.Models;
 using TgLlmBot.Services.Telegram.TypingStatus;
 using Xunit;
 
@@ -25,10 +27,15 @@ public sealed class DefaultLlmChatHandlerTests
     private const string Markdown = "**ответ** [ссылка](https://example.com)";
     private const string HistoryText = "ответ ссылка (https://example.com)";
 
-    [Fact]
-    public async Task HandleCommandAsync_FormattingError_RetriesTypedBlocksAndStoresHistoryOnce()
+    [Theory]
+    [InlineData("Bad Request: can't parse entities")]
+    [InlineData("Bad Request: invalid rich message")]
+    [InlineData("Bad Request: RICH_MESSAGE_INVALID")]
+    [InlineData("Bad Request: unsupported tag 'example'")]
+    [InlineData("Bad Request: Unsupported start tag 'example'")]
+    public async Task HandleCommandAsync_FormattingError_RetriesTypedBlocksAndStoresHistoryOnce(string description)
     {
-        using var api = new StubTelegramApi(400, "Bad Request: can't parse entities");
+        using var api = new StubTelegramApi(400, description);
         using var http = new HttpClient(api);
         using var chat = new StubChatClient();
         var services = new ChatHandlerTestServices();
@@ -60,8 +67,11 @@ public sealed class DefaultLlmChatHandlerTests
 
     [Theory]
     [InlineData(400, "Bad Request: chat not found")]
+    [InlineData(400, "Bad Request: entity not found")]
+    [InlineData(400, "Bad Request: failed to parse chat_id")]
+    [InlineData(400, "Bad Request: sender identity is invalid")]
     [InlineData(429, "Too Many Requests")]
-    [InlineData(500, "Internal Server Error: parse failed")]
+    [InlineData(500, "Internal Server Error: can't parse rich message")]
     public async Task HandleCommandAsync_OtherApiError_DoesNotRetryRichMessage(int errorCode, string description)
     {
         using var api = new StubTelegramApi(errorCode, description);
@@ -93,6 +103,109 @@ public sealed class DefaultLlmChatHandlerTests
         Assert.Equal(1, chat.Calls);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HandleCommandAsync_PartialResponseFailure_SendsNoticeWithoutStoringOrResendingIt(bool storageFailure)
+    {
+        using var api = storageFailure ? new StubTelegramApi() : new StubTelegramApi(500, "Internal Server Error", failedRequest: 2);
+        using var http = new HttpClient(api);
+        using var chat = new StubChatClient(new string('a', 5000));
+        var services = new ChatHandlerTestServices { FailStore = storageFailure };
+        var handler = CreateHandler(http, chat, services);
+
+        await handler.HandleCommandAsync(CreateCommand(), TestContext.Current.CancellationToken);
+
+        string[] expectedMethods = storageFailure ? ["sendRichMessage", "sendMessage"] : ["sendRichMessage", "sendRichMessage", "sendMessage"];
+        Assert.Equal(expectedMethods, api.Methods);
+        var notice = api.Bodies[^1];
+        Assert.Equal("⚠️ Не удалось отправить ответ полностью. Повторите запрос.", notice.GetProperty("text").GetString());
+        Assert.Equal(ChatId, notice.GetProperty("chat_id").GetInt64());
+        Assert.Equal(17, notice.GetProperty("message_thread_id").GetInt32());
+        Assert.Equal(42, notice.GetProperty("reply_parameters").GetProperty("message_id").GetInt32());
+        Assert.Equal(1, services.StoreAttempts);
+        if (storageFailure)
+        {
+            Assert.Empty(services.StoredTexts);
+        }
+        else
+        {
+            Assert.Equal(new string('a', 4096), Assert.Single(services.StoredTexts));
+        }
+
+        Assert.Equal(1, chat.Calls);
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_StorageFailureAfterFinalPart_DoesNotSendInterruptionNotice()
+    {
+        using var api = new StubTelegramApi();
+        using var http = new HttpClient(api);
+        using var chat = new StubChatClient(new string('a', 5000));
+        var services = new ChatHandlerTestServices { FailStoreOnAttempt = 2 };
+        var handler = CreateHandler(http, chat, services);
+
+        await handler.HandleCommandAsync(CreateCommand(), TestContext.Current.CancellationToken);
+
+        Assert.Equal(["sendRichMessage", "sendRichMessage"], api.Methods);
+        Assert.Equal(2, services.StoreAttempts);
+        Assert.Equal(new string('a', 4096), Assert.Single(services.StoredTexts));
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_InterruptionNoticeFails_DoesNotRetryResponseOrStoreNotice()
+    {
+        using var api = new StubTelegramApi(403, "Forbidden", failedRequest: 2);
+        api.Errors.Add(3, (403, "Forbidden"));
+        using var http = new HttpClient(api);
+        using var chat = new StubChatClient(new string('a', 5000));
+        var services = new ChatHandlerTestServices();
+        var handler = CreateHandler(http, chat, services);
+
+        await handler.HandleCommandAsync(CreateCommand(), TestContext.Current.CancellationToken);
+
+        Assert.Equal(["sendRichMessage", "sendRichMessage", "sendMessage"], api.Methods);
+        Assert.Equal(1, services.StoreAttempts);
+        Assert.Equal(new string('a', 4096), Assert.Single(services.StoredTexts));
+        Assert.Equal(1, chat.Calls);
+    }
+
+    [Theory]
+    [InlineData(null, null, "", null, "rich reply")]
+    [InlineData(null, null, " \t", "\n ", "rich reply")]
+    [InlineData(" \t", null, null, null, "rich reply")]
+    [InlineData(" \t", " stored text ", "text reply", "caption reply", "stored text")]
+    [InlineData(null, null, " ", " caption reply ", "caption reply")]
+    [InlineData(null, null, " text reply ", "caption reply", "text reply")]
+    [InlineData(" stored reply ", null, "text reply", "caption reply", "stored reply")]
+    public async Task HandleCommandAsync_ReplyWithEmptyFields_UsesFirstNonWhitespaceText(string? storedCaption, string? storedText, string? text, string? caption, string expected)
+    {
+        using var api = new StubTelegramApi();
+        using var http = new HttpClient(api);
+        using var chat = new StubChatClient();
+        var services = new ChatHandlerTestServices
+        {
+            RepliedMessage = storedCaption is null && storedText is null ? null : new DbChatMessage { MessageId = 11, Caption = storedCaption, Text = storedText }
+        };
+        var handler = CreateHandler(http, chat, services);
+        var command = CreateCommand();
+        command.Message.ReplyToMessage = new()
+        {
+            Id = 11,
+            Chat = command.Message.Chat,
+            From = command.Self,
+            Text = text,
+            Caption = caption,
+            RichMessage = new() { Blocks = [new RichBlockParagraph { Text = new RichTextText { Text = "rich reply" } }] }
+        };
+
+        await handler.HandleCommandAsync(command, TestContext.Current.CancellationToken);
+
+        Assert.Contains($"↳ в ответ на твоё сообщение #11: «{expected}»", chat.UserMessage, StringComparison.Ordinal);
+        Assert.Equal(["sendRichMessage"], api.Methods);
+        Assert.Equal(HistoryText, Assert.Single(services.StoredTexts));
+    }
+
     private static DefaultLlmChatHandler CreateHandler(HttpClient http, StubChatClient chat, ChatHandlerTestServices services)
     {
         var bot = new TelegramBotClient(new TelegramBotClientOptions("123456:TEST_TOKEN") { RetryCount = 0 }, http);
@@ -116,14 +229,17 @@ public sealed class DefaultLlmChatHandlerTests
         }, UpdateType.Message, new() { Id = 123456, IsBot = true, FirstName = "Bot" }, null);
     }
 
-    private sealed class StubChatClient : IChatClient
+    private sealed class StubChatClient(string response = Markdown) : IChatClient
     {
         public int Calls { get; private set; }
+
+        public string? UserMessage { get; private set; }
 
         public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
         {
             Calls++;
-            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, Markdown)));
+            UserMessage = messages.Last(static message => message.Role == ChatRole.User).Text;
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, response)));
         }
 
         public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -135,8 +251,18 @@ public sealed class DefaultLlmChatHandlerTests
         }
     }
 
-    private sealed class StubTelegramApi(int? errorCode = null, string? description = null) : HttpMessageHandler
+    private sealed class StubTelegramApi : HttpMessageHandler
     {
+        public StubTelegramApi(int? errorCode = null, string? description = null, int failedRequest = 1)
+        {
+            if (errorCode is { } code)
+            {
+                Errors.Add(failedRequest, (code, description ?? "API error"));
+            }
+        }
+
+        public Dictionary<int, (int Code, string Description)> Errors { get; } = [];
+
         public List<string> Methods { get; } = [];
 
         public List<JsonElement> Bodies { get; } = [];
@@ -149,15 +275,15 @@ public sealed class DefaultLlmChatHandlerTests
             using var document = JsonDocument.Parse(await request.Content.ReadAsStringAsync(cancellationToken));
             var body = document.RootElement.Clone();
             Bodies.Add(body);
-            var failed = Bodies.Count == 1 && errorCode.HasValue;
+            var failed = Errors.TryGetValue(Bodies.Count, out var error);
             var json = failed
-                ? JsonSerializer.Serialize(new { ok = false, error_code = errorCode, description })
+                ? JsonSerializer.Serialize(new { ok = false, error_code = error.Code, description = error.Description })
                 : JsonSerializer.Serialize(new
                 {
                     ok = true,
                     result = new { message_id = 99, date = 1792584000, chat = new { id = ChatId, type = "supergroup" }, text = body.TryGetProperty("text", out var text) ? text.GetString() : null }
                 });
-            return new(failed ? (HttpStatusCode) errorCode!.Value : HttpStatusCode.OK)
+            return new(failed ? (HttpStatusCode) error.Code : HttpStatusCode.OK)
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
