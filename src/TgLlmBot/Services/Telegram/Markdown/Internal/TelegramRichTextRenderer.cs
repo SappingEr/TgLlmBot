@@ -19,25 +19,35 @@ internal sealed class TelegramRichTextRenderer
     private const int FormattingDepthLimit = 12;
 
     private readonly StringBuilder _html = new();
+    private readonly bool _measureOnly;
     private readonly List<OpenTag> _openTags = [];
     private readonly int _partLengthLimit;
     private readonly List<TelegramRichTextPart> _parts = [];
     private readonly StringBuilder _text = new();
     private int _blockCount;
+    private int[] _textBoundaries = [];
+    private int _textOffset;
     private bool _hasText;
     private bool _preformatted;
     private bool _requiresPlainText;
     private int _trailingNewlines;
 
-    public TelegramRichTextRenderer(int partLengthLimit)
+    public TelegramRichTextRenderer(int partLengthLimit, bool measureOnly = false)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(partLengthLimit, 2);
         _partLengthLimit = partLengthLimit;
+        _measureOnly = measureOnly;
     }
 
     public TelegramRichTextPart[] RenderParted(MarkdownDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        if (!_measureOnly)
+        {
+            var measured = new TelegramRichTextRenderer(int.MaxValue, measureOnly: true).RenderParted(document);
+            PrepareTextBoundaries(measured.Length == 0 ? string.Empty : measured[0].Text);
+        }
+
         foreach (var block in document)
         {
             RenderBlock(block);
@@ -50,6 +60,12 @@ internal sealed class TelegramRichTextRenderer
     public TelegramRichTextPart[] RenderPlainText(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return [];
+        }
+
+        PrepareTextBoundaries(text);
         Open("<p>", "</p>");
         AppendText(text);
         Close();
@@ -145,17 +161,32 @@ internal sealed class TelegramRichTextRenderer
         {
             var item = (ListItemBlock) child;
             AppendSeparator(1);
-            var number = item.Order.ToString(CultureInfo.InvariantCulture);
-            Open(list.IsOrdered ? $"<li value=\"{number}\">" : "<li>", "</li>");
-            AppendText(list.IsOrdered ? $"{number}. " : "• ", false);
-            var firstBlock = true;
-            foreach (var block in item)
+            if (!_measureOnly && _text.Length > 0)
             {
-                RenderBlock(block, !firstBlock);
-                firstBlock = false;
+                var measured = new TelegramRichTextRenderer(int.MaxValue, measureOnly: true);
+                measured.RenderListItem(item, list.IsOrdered);
+                if (_blockCount + measured._blockCount > BlockCountLimit || measured._text.Length > _partLengthLimit - _text.Length)
+                {
+                    FinishPart();
+                }
             }
 
-            Close();
+            RenderListItem(item, list.IsOrdered);
+        }
+
+        Close();
+    }
+
+    private void RenderListItem(ListItemBlock item, bool ordered)
+    {
+        var number = item.Order.ToString(CultureInfo.InvariantCulture);
+        Open(ordered ? $"<li value=\"{number}\">" : "<li>", "</li>");
+        AppendText(ordered ? $"{number}. " : "• ", false);
+        var firstBlock = true;
+        foreach (var block in item)
+        {
+            RenderBlock(block, !firstBlock);
+            firstBlock = false;
         }
 
         Close();
@@ -179,11 +210,11 @@ internal sealed class TelegramRichTextRenderer
                 AppendText("\n", wide);
             }
 
-            if (!wide)
+            if (!wide && !_measureOnly)
             {
                 // Строка, помещающаяся в одну часть, переносится целиком при любом из лимитов.
                 // Для измерения используем тот же рендеринг, чтобы учитывать код, ссылки и entities.
-                var measured = new TelegramRichTextRenderer(int.MaxValue);
+                var measured = new TelegramRichTextRenderer(int.MaxValue, measureOnly: true);
                 measured.RenderTableRow(row, false);
                 if (_text.Length > 0 && (_blockCount + measured._blockCount > BlockCountLimit || measured._text.Length > _partLengthLimit - _text.Length))
                 {
@@ -345,7 +376,7 @@ internal sealed class TelegramRichTextRenderer
     private void RenderLink(LinkInline link, bool formatted)
     {
         var url = link.Url ?? string.Empty;
-        var measured = new TelegramRichTextRenderer(int.MaxValue);
+        var measured = new TelegramRichTextRenderer(int.MaxValue, measureOnly: true);
         if (link.FirstChild is null)
         {
             measured.AppendText(url);
@@ -389,7 +420,7 @@ internal sealed class TelegramRichTextRenderer
 
     private void Open(string start, string end, bool block = true, int precedingCells = 0, int followingCells = 0)
     {
-        if (block && _blockCount >= BlockCountLimit && _text.Length > 0)
+        if (!_measureOnly && block && _blockCount >= BlockCountLimit && _text.Length > 0)
         {
             FinishPart();
         }
@@ -460,35 +491,50 @@ internal sealed class TelegramRichTextRenderer
         }
     }
 
-    private int GetPartLength(string text, int capacity)
+    private void PrepareTextBoundaries(string text)
     {
-        if (text.Length <= capacity)
+        // Графема может проходить через несколько Markdown-узлов (например, e&#x301;).
+        // Границы считаем по всему тексту истории до разбиения и открытия HTML-тегов.
+        var boundaries = new List<int> { 0 };
+        var offset = 0;
+        while (offset < text.Length)
         {
-            return text.Length;
-        }
-
-        var length = 0;
-        while (length < text.Length)
-        {
-            var elementLength = StringInfo.GetNextTextElementLength(text.AsSpan(length));
-            if (length + elementLength > capacity)
+            var remaining = StringInfo.GetNextTextElementLength(text.AsSpan(offset));
+            while (remaining > _partLengthLimit)
             {
-                break;
+                // Даже чрезмерно длинная графема должна помещаться в поле БД.
+                var length = char.IsHighSurrogate(text[offset + _partLengthLimit - 1]) ? _partLengthLimit - 1 : _partLengthLimit;
+                offset += length;
+                remaining -= length;
+                boundaries.Add(offset);
             }
 
-            length += elementLength;
+            offset += remaining;
+            boundaries.Add(offset);
         }
 
-        // Непомерно длинная последовательность combining marks тоже должна помещаться в поле БД.
-        if (length == 0 && capacity == _partLengthLimit)
+        _textBoundaries = [.. boundaries];
+    }
+
+    private int GetPartLength(string text, int capacity)
+    {
+        if (_measureOnly)
         {
-            length = char.IsHighSurrogate(text[capacity - 1]) ? capacity - 1 : capacity;
+            return Math.Min(text.Length, capacity);
         }
 
-        if (length > 0)
+        var offset = _textOffset + _text.Length;
+        var boundaryIndex = Array.BinarySearch(_textBoundaries, offset + capacity);
+        if (boundaryIndex < 0)
+        {
+            boundaryIndex = ~boundaryIndex - 1;
+        }
+
+        var length = Math.Min(text.Length, Math.Max(0, _textBoundaries[boundaryIndex] - offset));
+        if (length > 0 && length < text.Length)
         {
             var boundary = text.LastIndexOfAny(['\n', ' ', '\t'], length - 1, length);
-            if (boundary >= length / 2)
+            if (boundary >= length / 2 && Array.BinarySearch(_textBoundaries, offset + boundary + 1) >= 0)
             {
                 length = boundary + 1;
             }
@@ -500,7 +546,7 @@ internal sealed class TelegramRichTextRenderer
     private void FinishPart()
     {
         var text = _text.ToString();
-        if (!string.IsNullOrWhiteSpace(text))
+        if (text.Length > 0)
         {
             for (var i = _openTags.Count - 1; i >= 0; i--)
             {
@@ -517,6 +563,7 @@ internal sealed class TelegramRichTextRenderer
             _parts.Add(new(text, html));
         }
 
+        _textOffset += text.Length;
         _text.Clear();
         _html.Clear();
         _blockCount = 0;
