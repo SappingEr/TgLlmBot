@@ -18,4 +18,12 @@ public class TelegramOptions
     [MinLength(1)]
     [MaxLength(100)]
     public string BotName { get; set; } = default!;
+
+    public bool CollapseLongResponses { get; set; } = true;
+
+    [Range(1, int.MaxValue)]
+    public int ResponseCollapseCharacterThreshold { get; set; } = 600;
+
+    [Range(1, int.MaxValue)]
+    public int ResponseCollapseLineThreshold { get; set; } = 8;
 }

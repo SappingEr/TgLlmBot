@@ -336,6 +336,11 @@ public partial class Program
         builder.Services.AddHostedService<MediaRecognitionBackgroundService>();
         // LLM Chat
         builder.Services.AddSingleton(new DefaultLlmChatHandlerOptions(config.Telegram.BotName, config.Llm.DefaultResponse));
+        builder.Services.AddSingleton(new DefaultLlmResponseFormatterOptions(
+            config.Telegram.CollapseLongResponses,
+            config.Telegram.ResponseCollapseCharacterThreshold,
+            config.Telegram.ResponseCollapseLineThreshold));
+        builder.Services.AddSingleton<ILlmResponseFormatter, DefaultLlmResponseFormatter>();
         builder.Services.AddSingleton<ILlmChatHandler, DefaultLlmChatHandler>();
         // DataAccess
         builder.Services.AddDbContext<BotDbContext>(dbContextOptions =>

@@ -69,11 +69,33 @@ public class DefaultTelegramMessageStorage : ITelegramMessageStorage
         return StoreMessageAsync(message, self, AppliedCustomPrompt.None, cancellationToken);
     }
 
-    [SuppressMessage("ReSharper", "ConvertToUsingDeclaration")]
-    public async Task<DbChatMessage> StoreMessageAsync(
+    public Task<DbChatMessage> StoreMessageAsync(
         Message message,
         User self,
         AppliedCustomPrompt customPrompt,
+        CancellationToken cancellationToken)
+    {
+        return StoreMessageCoreAsync(message, self, customPrompt, null, cancellationToken);
+    }
+
+    public Task<DbChatMessage> StoreMessageAsync(
+        Message message,
+        User self,
+        AppliedCustomPrompt customPrompt,
+        string text,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(text.Length, 4096);
+        return StoreMessageCoreAsync(message, self, customPrompt, text, cancellationToken);
+    }
+
+    [SuppressMessage("ReSharper", "ConvertToUsingDeclaration")]
+    private async Task<DbChatMessage> StoreMessageCoreAsync(
+        Message message,
+        User self,
+        AppliedCustomPrompt customPrompt,
+        string? text,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -82,7 +104,7 @@ public class DefaultTelegramMessageStorage : ITelegramMessageStorage
             var dbContext = asyncScope.ServiceProvider.GetRequiredService<BotDbContext>();
             await using (var transaction = await dbContext.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken))
             {
-                var dbChatMessage = CreateDbChatMessage(message, self, customPrompt);
+                var dbChatMessage = CreateDbChatMessage(message, self, customPrompt, text);
                 // Вложения уезжают в базу вместе с сообщением: внешний ключ EF проставит сам
                 dbContext.ChatHistory.Add(dbChatMessage);
                 await dbContext.SaveChangesAsync(cancellationToken);
@@ -340,7 +362,7 @@ public class DefaultTelegramMessageStorage : ITelegramMessageStorage
         }
     }
 
-    private static DbChatMessage CreateDbChatMessage(Message message, User self, AppliedCustomPrompt customPrompt)
+    private static DbChatMessage CreateDbChatMessage(Message message, User self, AppliedCustomPrompt customPrompt, string? text)
     {
         ArgumentNullException.ThrowIfNull(message);
         ArgumentNullException.ThrowIfNull(self);
@@ -356,7 +378,7 @@ public class DefaultTelegramMessageStorage : ITelegramMessageStorage
             SurrogatePairSanitizer.SanitizeInvalidUtf16(message.From?.Username),
             SurrogatePairSanitizer.SanitizeInvalidUtf16(message.From?.FirstName),
             SurrogatePairSanitizer.SanitizeInvalidUtf16(message.From?.LastName),
-            SurrogatePairSanitizer.SanitizeInvalidUtf16(message.Text),
+            SurrogatePairSanitizer.SanitizeInvalidUtf16(text ?? message.Text),
             SurrogatePairSanitizer.SanitizeInvalidUtf16(message.Caption),
             isSelfMessage,
             message.MediaGroupId,

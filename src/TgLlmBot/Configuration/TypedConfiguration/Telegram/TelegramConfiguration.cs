@@ -10,7 +10,10 @@ public class TelegramConfiguration
     private TelegramConfiguration(
         string botToken,
         IReadOnlySet<long> allowedChatIds,
-        string botName)
+        string botName,
+        bool collapseLongResponses,
+        int responseCollapseCharacterThreshold,
+        int responseCollapseLineThreshold)
     {
         ArgumentNullException.ThrowIfNull(botToken);
         if (string.IsNullOrEmpty(botToken))
@@ -24,9 +27,14 @@ public class TelegramConfiguration
             throw new ArgumentException("Value should contain at least 1 element", nameof(allowedChatIds));
         }
 
+        ArgumentOutOfRangeException.ThrowIfLessThan(responseCollapseCharacterThreshold, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(responseCollapseLineThreshold, 1);
         BotToken = botToken;
         AllowedChatIds = allowedChatIds;
         BotName = botName;
+        CollapseLongResponses = collapseLongResponses;
+        ResponseCollapseCharacterThreshold = responseCollapseCharacterThreshold;
+        ResponseCollapseLineThreshold = responseCollapseLineThreshold;
     }
 
     public string BotToken { get; }
@@ -35,12 +43,21 @@ public class TelegramConfiguration
 
     public string BotName { get; }
 
+    public bool CollapseLongResponses { get; }
+
+    public int ResponseCollapseCharacterThreshold { get; }
+
+    public int ResponseCollapseLineThreshold { get; }
+
     public static TelegramConfiguration Convert(TelegramOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
         return new(
             options.BotToken,
             options.AllowedChatIds.ToHashSet(),
-            options.BotName);
+            options.BotName,
+            options.CollapseLongResponses,
+            options.ResponseCollapseCharacterThreshold,
+            options.ResponseCollapseLineThreshold);
     }
 }

@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using TgLlmBot.Configuration.TypedConfiguration.Llm;
@@ -22,7 +23,7 @@ using TgLlmBot.Services.Llm.Multimodal;
 using TgLlmBot.Services.Mcp.Tools;
 using TgLlmBot.Services.Media;
 using TgLlmBot.Services.Resources;
-using TgLlmBot.Services.Telegram.Markdown;
+using TgLlmBot.Services.Telegram;
 using TgLlmBot.Services.Telegram.TypingStatus;
 using ChatMessage = Microsoft.Extensions.AI.ChatMessage;
 
@@ -51,9 +52,9 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
     private readonly IMediaGroupTracker _mediaGroupTracker;
     private readonly DefaultLlmChatHandlerOptions _options;
     private readonly IMediaPreparer _preparer;
+    private readonly ILlmResponseFormatter _responseFormatter;
     private readonly ITelegramMessageStorage _storage;
     private readonly ISystemPromptService _systemPrompt;
-    private readonly ITelegramMarkdownConverter _telegramMarkdownConverter;
     private readonly TimeProvider _timeProvider;
     private readonly IMcpToolsProvider _tools;
     private readonly ITypingStatusService _typingStatusService;
@@ -67,7 +68,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         IMediaPreparer preparer,
         IMediaGroupTracker mediaGroupTracker,
         ISystemPromptService systemPrompt,
-        ITelegramMarkdownConverter telegramMarkdownConverter,
+        ILlmResponseFormatter responseFormatter,
         ITelegramMessageStorage storage,
         IMcpToolsProvider tools,
         ITypingStatusService typingStatusService,
@@ -82,7 +83,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         ArgumentNullException.ThrowIfNull(preparer);
         ArgumentNullException.ThrowIfNull(mediaGroupTracker);
         ArgumentNullException.ThrowIfNull(systemPrompt);
-        ArgumentNullException.ThrowIfNull(telegramMarkdownConverter);
+        ArgumentNullException.ThrowIfNull(responseFormatter);
         ArgumentNullException.ThrowIfNull(storage);
         ArgumentNullException.ThrowIfNull(tools);
         ArgumentNullException.ThrowIfNull(typingStatusService);
@@ -96,7 +97,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         _preparer = preparer;
         _mediaGroupTracker = mediaGroupTracker;
         _systemPrompt = systemPrompt;
-        _telegramMarkdownConverter = telegramMarkdownConverter;
+        _responseFormatter = responseFormatter;
         _storage = storage;
         _tools = tools;
         _typingStatusService = typingStatusService;
@@ -109,6 +110,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
     {
         ArgumentNullException.ThrowIfNull(command);
         var typing = _typingStatusService.StartTyping(command.Message.Chat.Id);
+        var hasSentResponse = false;
         try
         {
             Log.ProcessingLlmRequest(_logger, command.Message.From?.Username, command.Message.From?.Id);
@@ -173,59 +175,43 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
                 llmResponseText = _options.DefaultResponse;
             }
 
+            LlmResponsePart[] parts;
             try
             {
-                var finalText = _telegramMarkdownConverter.ConvertToPartedTelegramMarkdown(llmResponseText, 2000);
-                typing.Stop();
-                for (var i = 0; i < finalText.Length; i++)
-                {
-                    await Task.Delay(1000, cancellationToken);
-                    var firstPart = i == 0;
-                    Message response;
-                    if (firstPart)
-                    {
-                        response = await _bot.SendMessage(
-                            command.Message.Chat,
-                            $"{finalText[i]}".Trim(),
-                            ParseMode.MarkdownV2,
-                            new()
-                            {
-                                MessageId = command.Message.MessageId
-                            },
-                            cancellationToken: cancellationToken);
-                    }
-                    else
-                    {
-                        response = await _bot.SendMessage(
-                            command.Message.Chat,
-                            $"{finalText[i]}".Trim(),
-                            ParseMode.MarkdownV2,
-                            cancellationToken: cancellationToken);
-                    }
-
-                    await _storage.StoreMessageAsync(response, command.Self, request.CustomPrompt, cancellationToken);
-                }
+                parts = _responseFormatter.Format(llmResponseText);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                Log.MarkdownConversionOrSendFailed(_logger, ex);
-                typing.Stop();
-                var response = await _bot.SendMessage(
-                    command.Message.Chat,
-                    llmResponseText,
-                    ParseMode.None,
-                    new()
-                    {
-                        MessageId = command.Message.MessageId
-                    },
-                    cancellationToken: cancellationToken);
-                await _storage.StoreMessageAsync(response, command.Self, request.CustomPrompt, cancellationToken);
+                Log.ResponseFormattingFailed(_logger, ex);
+                parts = _responseFormatter.FormatPlainText(llmResponseText);
             }
+
+            typing.Stop();
+            for (var i = 0; i < parts.Length; i++)
+            {
+                await Task.Delay(1000, cancellationToken);
+                ReplyParameters? replyParameters = i == 0 ? new() { MessageId = command.Message.MessageId } : null;
+                var response = await SendResponsePartAsync(command, parts[i], replyParameters, cancellationToken);
+                // Запись в БД может упасть уже после успешной отправки. Такой сбой не должен
+                // запускать повторную отправку этой части или всего ответа.
+                hasSentResponse = true;
+                await _storage.StoreMessageAsync(response, command.Self, request.CustomPrompt, parts[i].Text, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            typing.Stop();
+            throw;
         }
         catch (Exception ex)
         {
             Log.LlmInvocationOrImageProcessingFailed(_logger, ex);
             typing.Stop();
+
+            if (hasSentResponse)
+            {
+                return;
+            }
 
             var response = await _bot.SendMessage(
                 command.Message.Chat,
@@ -238,6 +224,43 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
                 cancellationToken: cancellationToken);
             await _storage.StoreMessageAsync(response, command.Self, cancellationToken);
         }
+    }
+
+    private async Task<Message> SendResponsePartAsync(
+        ChatWithLlmCommand command,
+        LlmResponsePart part,
+        ReplyParameters? replyParameters,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _bot.SendRichMessage(
+                command.Message.Chat,
+                part.CreateMessage(),
+                replyParameters,
+                messageThreadId: command.Message.MessageThreadId,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 400 && IsFormattingError(ex.Message))
+        {
+            Log.ResponseFormattingFailed(_logger, ex);
+            return await _bot.SendRichMessage(
+                command.Message.Chat,
+                part.CreateMessage(plainText: true),
+                replyParameters,
+                messageThreadId: command.Message.MessageThreadId,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private static bool IsFormattingError(string message)
+    {
+        return message.Contains("parse", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("entity", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("entities", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("unsupported tag", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("invalid rich message", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("rich_message_invalid", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -474,7 +497,8 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         ChatAuthorDirectory authors)
     {
         var isBotMessage = replied.From?.Id == command.Self.Id || reply.Parts.Any(static x => x.IsLlmReplyToMessage);
-        var text = reply.Caption ?? (replied.Text ?? replied.Caption)?.Trim();
+        var text = reply.Caption ?? (replied.Text ?? replied.Caption)?.Trim()
+            ?? (replied.RichMessage is { } richMessage ? TelegramRichMessageTextExtractor.Extract(richMessage) : null);
         var markers = reply.Attachments.Select(static x => ChatTranscriptFormat.FormatMediaMarker(x.Media));
         var excerpt = ChatTranscriptFormat.Excerpt(string.Join(' ', markers.Append(text).Where(static x => !string.IsNullOrEmpty(x))));
         if (isBotMessage)
@@ -869,7 +893,7 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         [LoggerMessage(Level = LogLevel.Error, Message = "Failed to invoke LLM or process media")]
         public static partial void LlmInvocationOrImageProcessingFailed(ILogger logger, Exception exception);
 
-        [LoggerMessage(Level = LogLevel.Error, Message = "Failed to convert to Telegram Markdown or send message")]
-        public static partial void MarkdownConversionOrSendFailed(ILogger logger, Exception exception);
+        [LoggerMessage(Level = LogLevel.Warning, Message = "Failed to format LLM response; retrying with plain text blocks")]
+        public static partial void ResponseFormattingFailed(ILogger logger, Exception exception);
     }
 }

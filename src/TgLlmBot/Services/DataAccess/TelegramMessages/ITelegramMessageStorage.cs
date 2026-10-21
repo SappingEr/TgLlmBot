@@ -41,6 +41,17 @@ public interface ITelegramMessageStorage
         CancellationToken cancellationToken);
 
     /// <summary>
+    ///     Сохраняет ответ бота с явно переданным текстом части: у Rich Messages обычное
+    ///     поле Message.Text отсутствует. Заголовок ката в историю не попадает.
+    /// </summary>
+    Task<DbChatMessage> StoreMessageAsync(
+        Message message,
+        User self,
+        AppliedCustomPrompt customPrompt,
+        string text,
+        CancellationToken cancellationToken);
+
+    /// <summary>
     ///     Возвращает историю чата до указанного сообщения по общему правилу
     ///     (200 сообщений или 30 000 символов бюджета), исключая само сообщение.
     /// </summary>
