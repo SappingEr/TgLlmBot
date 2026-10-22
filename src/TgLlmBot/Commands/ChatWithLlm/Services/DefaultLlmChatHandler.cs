@@ -516,9 +516,10 @@ public partial class DefaultLlmChatHandler : ILlmChatHandler
         MessageAttachments reply,
         ChatAuthorDirectory authors)
     {
-        var isBotMessage = replied.From?.Id == command.Self.Id || reply.Parts.Any(static x => x.IsLlmReplyToMessage);
+        var isOwnBotMessage = replied.From?.Id == command.Self.Id;
+        var isBotMessage = isOwnBotMessage || reply.Parts.Any(static x => x.IsLlmReplyToMessage);
         var text = FirstNonWhitespace(reply.Caption, replied.Text, replied.Caption)
-            ?? (replied.RichMessage is { } richMessage ? TelegramRichMessageTextExtractor.Extract(richMessage) : null);
+            ?? (replied.RichMessage is { } richMessage ? TelegramRichMessageTextExtractor.Extract(richMessage, isOwnBotMessage) : null);
         var markers = reply.Attachments.Select(static x => ChatTranscriptFormat.FormatMediaMarker(x.Media));
         var excerpt = ChatTranscriptFormat.Excerpt(string.Join(' ', markers.Append(text).Where(static x => !string.IsNullOrEmpty(x))));
         if (isBotMessage)

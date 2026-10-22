@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Telegram.Bot.Types;
 
@@ -7,10 +8,39 @@ namespace TgLlmBot.Services.Telegram;
 
 internal static class TelegramRichMessageTextExtractor
 {
-    public static string Extract(RichMessage message)
+    public static string Extract(RichMessage message, bool isOwnBotMessage)
     {
         ArgumentNullException.ThrowIfNull(message);
-        return ExtractBlocks(message.Blocks).Trim();
+        var blocks = message.Blocks;
+        // Только единственный внешний details нашего бота может быть служебной оболочкой.
+        // Заголовки чужих сообщений и вложенных блоков остаются частью контекста.
+        if (isOwnBotMessage && blocks is [RichBlockDetails details] && IsExpansionSummary(ExtractText(details.Summary)))
+        {
+            blocks = details.Blocks;
+        }
+
+        return ExtractBlocks(blocks).Trim();
+    }
+
+    private static bool IsExpansionSummary(string summary)
+    {
+        if (string.Equals(summary, "Развернуть ответ", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        const string prefix = "Развернуть ответ · ";
+        if (!summary.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var numbers = summary.AsSpan(prefix.Length);
+        var separator = numbers.IndexOf('/');
+        return separator > 0
+            && int.TryParse(numbers[..separator], NumberStyles.None, CultureInfo.InvariantCulture, out var part)
+            && int.TryParse(numbers[(separator + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out var total)
+            && total > 1 && part > 0 && part <= total;
     }
 
     private static string ExtractBlocks(IEnumerable<RichBlock> blocks)
@@ -26,8 +56,7 @@ internal static class TelegramRichMessageTextExtractor
             RichBlockSectionHeading heading => ExtractText(heading.Text),
             RichBlockPreformatted preformatted => ExtractText(preformatted.Text),
             RichBlockFooter footer => ExtractText(footer.Text),
-            // Summary у ответов бота служит кнопкой «Развернуть ответ», а не частью ответа.
-            RichBlockDetails details => ExtractBlocks(details.Blocks),
+            RichBlockDetails details => ExtractDetails(details),
             RichBlockBlockQuotation quote => ExtractBlocks(quote.Blocks),
             RichBlockExpandableBlockQuotation quote => ExtractText(quote.Text),
             RichBlockPullQuotation quote => ExtractText(quote.Text),
@@ -37,6 +66,31 @@ internal static class TelegramRichMessageTextExtractor
             RichBlockDivider => "───",
             _ => string.Empty
         };
+    }
+
+    private static string ExtractDetails(RichBlockDetails details)
+    {
+        var summary = ExtractText(details.Summary);
+        var content = ExtractBlocks(details.Blocks);
+        if (string.IsNullOrEmpty(summary))
+        {
+            return content;
+        }
+
+        return string.IsNullOrEmpty(content) ? summary : $"{summary}\n{content}";
+    }
+
+    private static string ExtractLink(RichTextUrl link)
+    {
+        var label = ExtractText(link.Text);
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            return link.Url;
+        }
+
+        return string.IsNullOrEmpty(link.Url) || string.Equals(label, link.Url, StringComparison.Ordinal)
+            ? label
+            : $"{label} ({link.Url})";
     }
 
     private static string ExtractText(RichText? text)
@@ -51,7 +105,7 @@ internal static class TelegramRichMessageTextExtractor
             RichTextStrikethrough strikethrough => ExtractText(strikethrough.Text),
             RichTextSpoiler spoiler => ExtractText(spoiler.Text),
             RichTextCode code => ExtractText(code.Text),
-            RichTextUrl url => ExtractText(url.Text),
+            RichTextUrl url => ExtractLink(url),
             RichTextTextMention mention => ExtractText(mention.Text),
             RichTextMention mention => ExtractText(mention.Text),
             RichTextDateTime dateTime => ExtractText(dateTime.Text),

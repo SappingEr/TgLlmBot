@@ -171,13 +171,14 @@ public sealed class DefaultLlmChatHandlerTests
     }
 
     [Theory]
-    [InlineData(null, null, "", null, "rich reply")]
-    [InlineData(null, null, " \t", "\n ", "rich reply")]
-    [InlineData(" \t", null, null, null, "rich reply")]
+    [InlineData(null, null, "", null, "Заголовок rich reply (https://example.com)")]
+    [InlineData(null, null, " \t", "\n ", "Заголовок rich reply (https://example.com)")]
+    [InlineData(" \t", null, null, null, "Заголовок rich reply (https://example.com)")]
     [InlineData(" \t", " stored text ", "text reply", "caption reply", "stored text")]
     [InlineData(null, null, " ", " caption reply ", "caption reply")]
     [InlineData(null, null, " text reply ", "caption reply", "text reply")]
     [InlineData(" stored reply ", null, "text reply", "caption reply", "stored reply")]
+    [InlineData(null, " saved link (https://saved.test) ", null, null, "saved link (https://saved.test)")]
     public async Task HandleCommandAsync_ReplyWithEmptyFields_UsesFirstNonWhitespaceText(string? storedCaption, string? storedText, string? text, string? caption, string expected)
     {
         using var api = new StubTelegramApi();
@@ -196,12 +197,235 @@ public sealed class DefaultLlmChatHandlerTests
             From = command.Self,
             Text = text,
             Caption = caption,
-            RichMessage = new() { Blocks = [new RichBlockParagraph { Text = new RichTextText { Text = "rich reply" } }] }
+            RichMessage = new()
+            {
+                Blocks =
+                [
+                    new RichBlockDetails
+                    {
+                        Summary = new RichTextText { Text = "Заголовок" },
+                        Blocks = [new RichBlockParagraph { Text = new RichTextUrl { Text = new RichTextText { Text = "rich reply" }, Url = "https://example.com" } }]
+                    }
+                ]
+            }
         };
 
         await handler.HandleCommandAsync(command, TestContext.Current.CancellationToken);
 
         Assert.Contains($"↳ в ответ на твоё сообщение #11: «{expected}»", chat.UserMessage, StringComparison.Ordinal);
+        Assert.Equal(["sendRichMessage"], api.Methods);
+        Assert.Equal(HistoryText, Assert.Single(services.StoredTexts));
+    }
+
+    [Theory]
+    [InlineData(true, "Отчёт за неделю", "Отчёт за неделю Содержимое")]
+    [InlineData(false, "Отчёт за неделю", "Отчёт за неделю Содержимое")]
+    [InlineData(true, "", "Содержимое")]
+    [InlineData(true, "Развернуть ответ", "Содержимое")]
+    [InlineData(true, "Развернуть ответ · 1/2", "Содержимое")]
+    [InlineData(true, "Развернуть ответ · 2/2", "Содержимое")]
+    [InlineData(false, "Развернуть ответ", "Развернуть ответ Содержимое")]
+    [InlineData(false, "Развернуть ответ · 1/2", "Развернуть ответ · 1/2 Содержимое")]
+    [InlineData(true, "Развернуть ответ: пояснения", "Развернуть ответ: пояснения Содержимое")]
+    [InlineData(true, "Развернуть ответ · 0/2", "Развернуть ответ · 0/2 Содержимое")]
+    [InlineData(true, "Развернуть ответ · 3/2", "Развернуть ответ · 3/2 Содержимое")]
+    [InlineData(true, "Развернуть ответ · 1/1", "Развернуть ответ · 1/1 Содержимое")]
+    [InlineData(true, "Развернуть ответ · 1/2 extra", "Развернуть ответ · 1/2 extra Содержимое")]
+    public async Task HandleCommandAsync_ReplyRichDetails_PreservesSummaryExceptOwnExpansionWrapper(bool fromSelf, string summary, string expected)
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks =
+            [
+                new RichBlockDetails
+                {
+                    Summary = new RichTextText { Text = summary },
+                    Blocks = [new RichBlockParagraph { Text = new RichTextText { Text = "Содержимое" } }]
+                }
+            ]
+        }, expected, fromSelf);
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_ReplyRichDetails_StoredBotMarkerDoesNotHideAnotherSendersSummary()
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks =
+            [
+                new RichBlockDetails
+                {
+                    Summary = new RichTextText { Text = "Развернуть ответ" },
+                    Blocks = [new RichBlockParagraph { Text = new RichTextText { Text = "Содержимое" } }]
+                }
+            ]
+        }, "Развернуть ответ Содержимое", fromSelf: false, storedMessage: new() { MessageId = 11, IsLlmReplyToMessage = true });
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_ReplyRichDetails_OnlyHidesGeneratedOuterSummary()
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks =
+            [
+                new RichBlockDetails
+                {
+                    Summary = new RichTextText { Text = "Развернуть ответ" },
+                    Blocks =
+                    [
+                        new RichBlockDetails
+                        {
+                            Summary = new RichTextText { Text = "Развернуть ответ" },
+                            Blocks = [new RichBlockParagraph { Text = new RichTextText { Text = "Вложенное содержимое" } }]
+                        },
+                        new RichBlockDetails
+                        {
+                            Summary = new RichTextText { Text = "Пояснения" },
+                            Blocks = [new RichBlockParagraph { Text = new RichTextText { Text = "Детали" } }]
+                        }
+                    ]
+                }
+            ]
+        }, "Развернуть ответ Вложенное содержимое Пояснения Детали");
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_ReplyRichDetails_WithSiblingBlockPreservesSummary()
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks =
+            [
+                new RichBlockParagraph { Text = new RichTextText { Text = "Введение" } },
+                new RichBlockDetails
+                {
+                    Summary = new RichTextText { Text = "Развернуть ответ" },
+                    Blocks = [new RichBlockParagraph { Text = new RichTextText { Text = "Содержимое" } }]
+                }
+            ]
+        }, "Введение Развернуть ответ Содержимое");
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_ReplyRichDetails_WithEmptyBodyPreservesSummary()
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks = [new RichBlockDetails { Summary = new RichTextText { Text = "Вопрос без пояснений" }, Blocks = [] }]
+        }, "Вопрос без пояснений", fromSelf: false);
+    }
+
+    [Theory]
+    [InlineData("сайт", "https://example.com", "сайт (https://example.com)")]
+    [InlineData("https://example.com", "https://example.com", "https://example.com")]
+    [InlineData("", "https://example.com", "https://example.com")]
+    [InlineData(" \t", "https://example.com", "https://example.com")]
+    [InlineData("сайт", "", "сайт")]
+    [InlineData("документы", "https://example.com?q=1&lang=ru#part", "документы (https://example.com?q=1&lang=ru#part)")]
+    public async Task HandleCommandAsync_ReplyRichLink_PreservesDestinationWithoutDuplicatingIt(string label, string url, string expected)
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks = [new RichBlockParagraph { Text = new RichTextUrl { Text = new RichTextText { Text = label }, Url = url } }]
+        }, expected);
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_ReplyRichLink_WithFormattedLabelPreservesDestination()
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks =
+            [
+                new RichBlockParagraph
+                {
+                    Text = new RichTextBold
+                    {
+                        Text = new RichTextArray
+                        {
+                            Array =
+                            [
+                                new RichTextText { Text = "См. " },
+                                new RichTextItalic
+                                {
+                                    Text = new RichTextUrl
+                                    {
+                                        Text = new RichTextArray
+                                        {
+                                            Array = [new RichTextText { Text = "доку" }, new RichTextCode { Text = new RichTextText { Text = "ментацию" } }]
+                                        },
+                                        Url = "https://example.com"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        }, "См. документацию (https://example.com)");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HandleCommandAsync_ReplyRichDetails_PreservesLinksInSummaryAndNestedBlocks(bool fromSelf)
+    {
+        await AssertRichReplyAsync(new()
+        {
+            Blocks =
+            [
+                new RichBlockDetails
+                {
+                    Summary = new RichTextUrl { Text = new RichTextText { Text = "Развернуть ответ" }, Url = "https://a.test" },
+                    Blocks =
+                    [
+                        new RichBlockBlockQuotation
+                        {
+                            Blocks =
+                            [
+                                new RichBlockList
+                                {
+                                    Items =
+                                    [
+                                        new RichBlockListItem
+                                        {
+                                            Label = "1.",
+                                            Blocks = [new RichBlockParagraph { Text = new RichTextUrl { Text = new RichTextText { Text = "сайт" }, Url = "https://b.test" } }]
+                                        }
+                                    ]
+                                },
+                                new RichBlockTable
+                                {
+                                    Cells = [[new RichBlockTableCell { Text = new RichTextUrl { Text = new RichTextText { Text = "документы" }, Url = "https://c.test" } }]]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }, "Развернуть ответ (https://a.test) сайт (https://b.test) документы (https://c.test)", fromSelf);
+    }
+
+    private static async Task AssertRichReplyAsync(RichMessage richMessage, string expected, bool fromSelf = true, DbChatMessage? storedMessage = null)
+    {
+        using var api = new StubTelegramApi();
+        using var http = new HttpClient(api);
+        using var chat = new StubChatClient();
+        var services = new ChatHandlerTestServices { RepliedMessage = storedMessage };
+        var handler = CreateHandler(http, chat, services);
+        var command = CreateCommand();
+        command.Message.ReplyToMessage = new()
+        {
+            Id = 11,
+            Chat = command.Message.Chat,
+            From = fromSelf ? command.Self : new() { Id = 9, IsBot = true, FirstName = "Other bot" },
+            RichMessage = richMessage
+        };
+
+        await handler.HandleCommandAsync(command, TestContext.Current.CancellationToken);
+
+        Assert.Contains($": «{expected}»", chat.UserMessage, StringComparison.Ordinal);
         Assert.Equal(["sendRichMessage"], api.Methods);
         Assert.Equal(HistoryText, Assert.Single(services.StoredTexts));
     }
